@@ -1,0 +1,586 @@
+---
+title: "Final Project Code_Varun Subramaniam"
+author: "Varun Subramaniam"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Final Code for Research Project (PUBH 6886)
+
+Loading Libraries:
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+library(caret)
+library(tidyverse)
+library(knitr)
+library(leaps)
+library(glmnet)
+library(dplyr)
+library(splines)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+```
+
+Loading `raw_fars14` dataset. This step involves loading the 2014 FARS data set, measuring number of fatalities.
+
+```{r}
+#Loading raw_fars14 data
+raw_fars14 <- read.csv('~/Desktop/Varun/GWSPH/Spring 2023/PUBH 6886/Research Project/FARSData.csv')
+
+#Defining target columns
+target_cols <- c(
+  'fatals',
+  'nhs',
+  'lgt_cond',
+  'weather',
+  'drunk_dr',
+  'total_invalid_license',
+  'no_prev_acc',
+  'one_prev_acc',
+  'two_prev_acc',
+  'no_prev_sus',
+  'one_prev_sus',
+  'two_prev_sus',
+  'no_prev_dwi',
+  'one_prev_dwi',
+  'no_prev_spd',
+  'one_prev_spd',
+  'speed_related',
+  'dr_age_lower16',
+  'dr_age_lower18',
+  'dr_age_lower21',
+  'dr_age_lower30',
+  'dr_age_lower65',
+  'dr_age_65over',
+  'drugs_inv',
+  'dr_alcohol_drug_med',
+  'dr_other_impair'
+)
+
+#Restrict fars to only target columns
+fars14 <- raw_fars14[,target_cols]
+
+#Assess dimensions
+dim(fars14)
+```
+
+Cleaning Data:
+
+```{r}
+#Remove all NAs
+fars14 <- na.omit(fars14)
+
+#Re-assess dimensions
+dim(fars14)
+```
+
+```{r}
+#Convert specific variables to factors
+factor_cols <- c('nhs',
+                 'lgt_cond',
+                 'weather',
+                 'speed_related',
+                 'drugs_inv',
+                 'dr_alcohol_drug_med',
+                 'dr_other_impair'
+                 )
+
+fars14[,factor_cols] <- lapply(fars14[,factor_cols] , factor)
+
+#Scale non-factor predictors
+fars14[,c(5:16, 18:23)] <- scale(fars14[,c(5:16, 18:23)])
+
+#Assess each variable type
+str(fars14)
+```
+
+Setting Up `x` and `y` Variables:
+
+```{r}
+#Setup X and Y variables
+fars14_x <- model.matrix(~., data = fars14[,-1])
+fars14_y <- fars14$fatals
+```
+
+## TESTING LINEAR MODELS WITH `fars14`
+
+### MODEL 1: LINEAR REGRESSION
+
+```{r}
+#For reproducibility
+set.seed(1234)
+
+#Generating a linear model with 10-fold CV
+suppressWarnings(
+  linear_model <- train(x = fars14_x, y= fars14_y, method = 'lm',
+                      trControl = trainControl(method = 'cv', number = 10))
+)
+
+#Viewing RMSE and R-squared values
+linear_model$results[c("RMSE", "Rsquared")]
+```
+
+### MODEL 2: FORWARD STEPWISE SELECTION
+
+```{r}
+#For reproducibility
+set.seed(1234)
+
+#Create forward stepwise selection for linear model; max of 25 predictors
+suppressWarnings(
+  forward_train <- train(x = fars14_x, y = fars14_y, 
+                       method = "leapForward",
+                       verbose = F,
+                       trControl = trainControl(method = "cv", number = 10),
+                       tuneGrid = data.frame(nvmax = 1:25)))
+
+
+#Plot number of predictors vs 10-Fold CV RMSE
+plot(x = forward_train$results$nvmax, y = forward_train$results$RMSE,
+     xlab = 'Number of Predictors', ylab = '10-Fold CV RMSE', main = 'Forward Stepwise',
+     type = 'l', col = 'red')
+
+#Add point at minimum 10-Fold CV RMSE
+points(forward_train$bestTune, 
+       min(forward_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(forward_train$bestTune,
+     min(forward_train$results$RMSE),
+     forward_train$bestTune,
+     pos = 3)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with tuning parameters
+forward_train$results[which.min(forward_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### MODEL 3: BACKWARD STEPWISE SELECTION
+
+```{r}
+#For reproducibility
+set.seed(1234)
+
+#Create backward stepwise selection for linear model; max of 100 predictors
+suppressWarnings(
+  backward_train <- train(x = fars14_x, y = fars14_y, 
+                       method = "leapBackward",
+                       trControl = trainControl(method = "cv", number = 10),
+                       tuneGrid = data.frame(nvmax = 1:25)))
+
+#Plot number of predictors vs 10-Fold CV RMSE
+plot(x = backward_train$results$nvmax, y = backward_train$results$RMSE,
+     xlab = 'Number of Predictors', ylab = '10-Fold CV RMSE', main = "Backward Stepwise",
+     type = 'l', col = 'blue')
+
+#Add point at minimum 10-Fold CV RMSE
+points(backward_train$bestTune, 
+       min(backward_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(backward_train$bestTune,
+     min(backward_train$results$RMSE),
+     backward_train$bestTune,
+     pos = 3)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with tuning parameters
+backward_train$results[which.min(backward_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### MODEL 4: PCR REGRESSION
+
+```{r}
+#Loading PLS library for PCR method
+library(pls)
+
+#Reproducibility
+set.seed(1234)
+
+#Producing PCR model
+pcr_train <- train(x = fars14_x, y = fars14_y, method = 'pcr', 
+                   trControl = trainControl(method = 'cv', number = 10),
+                   tuneGrid = data.frame(ncomp = 1:25))
+
+#Plot number of predictors vs 10-Fold CV RMSE
+plot(x = pcr_train$results$ncomp, y = pcr_train$results$RMSE,
+     xlab = 'Number of Predictors', ylab = '10-Fold CV RMSE', main = "PCR",
+     type = 'l', col = 'brown')
+
+#Add point at minimum 10-Fold CV RMSE
+points(pcr_train$bestTune, 
+       min(pcr_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(pcr_train$bestTune,
+     min(pcr_train$results$RMSE),
+     pcr_train$bestTune,
+     pos = 3)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with tuning parameters
+pcr_train$results[which.min(pcr_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### MODEL 5: PLS REGRESSION
+
+```{r}
+#Producing the plot
+set.seed(1234)
+pls_train <- train(x = fars14_x, y = fars14_y, method = 'pls', 
+                   trControl = trainControl(method = 'cv', number = 10),
+                   tuneGrid = data.frame(ncomp = 1:25))
+
+#Plot number of predictors vs 10-Fold CV RMSE
+plot(x = pls_train$results$ncomp, y = pls_train$results$RMSE,
+     xlab = 'Number of Predictors', ylab = '10-Fold CV RMSE', main = "PLS",
+     type = 'l', col = 'darkgreen')
+
+#Add point at minimum 10-Fold CV RMSE
+points(pls_train$bestTune, 
+       min(pls_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(pls_train$bestTune,
+     min(pls_train$results$RMSE),
+     pls_train$bestTune,
+     pos = 3)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with tuning parameters
+pls_train$results[which.min(pls_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### MODEL 6: RIDGE REGRESSION
+
+```{r}
+#Reproducibility
+set.seed(1234)
+
+#Setting up ridge regression using glmnet()
+ridge_values <- glmnet(x = fars14_x, y = fars14_y, alpha = 0.0)
+
+#Creating tunegrid dataframe containing alpha and lambda values
+ridge_tg <- data.frame(alpha = 0.0, lambda = ridge_values$lambda)
+
+#Creating Ridge Regression model
+suppressWarnings(
+  ridge_train <- train(x = fars14_x, y = fars14_y, method = "glmnet",
+                     tuneGrid = ridge_tg,
+                     trControl = trainControl(method = 'cv', number = 10)))
+
+#Plot raw lambda vs 10-Fold CV RMSE values
+plot(x = ridge_train$results$lambda, y = ridge_train$results$RMSE,
+     xlab = 'Lambda', ylab = '10-Fold CV RMSE', main = "Ridge",
+     type = 'l', col = 'darkblue')
+
+#Add point at minimum 10-Fold CV RMSE (NOTE: specify lambda value for bestTune)
+points(ridge_train$bestTune[2], 
+       min(ridge_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(ridge_train$bestTune[2],
+     min(ridge_train$results$RMSE),
+     round(ridge_train$bestTune[2], 5),
+     pos = 4)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with optimal lambda
+ridge_train$results[which.min(ridge_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### MODEL 7: LASSO REGRESSION
+
+```{r}
+#Reproducibility
+set.seed(1234)
+
+#Setting up ridge regression using glmnet()
+lasso_values <- glmnet(x = fars14_x, y = fars14_y, alpha = 1.0)
+
+#Creating tunegrid dataframe containing alpha and lambda values
+lasso_tg <- data.frame(alpha = 1.0, lambda = lasso_values$lambda)
+
+#Creating Ridge Regression model
+suppressWarnings(
+  lasso_train <- train(x = fars14_x, y = fars14_y, method = "glmnet",
+                     tuneGrid = lasso_tg,
+                     trControl = trainControl(method = 'cv', number = 10)))
+
+#Plot raw lambda vs 10-Fold CV RMSE values
+plot(x = lasso_train$results$lambda, y = lasso_train$results$RMSE,
+     xlab = 'Lambda', ylab = '10-Fold CV RMSE', main = "LASSO",
+     type = 'l', col = 'purple')
+
+#Add point at minimum 10-Fold CV RMSE (NOTE: specify lambda value for bestTune)
+points(lasso_train$bestTune[2], 
+       min(lasso_train$results$RMSE),
+       pch = 4)
+
+#Label point with optimal tuning parameter
+text(lasso_train$bestTune[2],
+     min(lasso_train$results$RMSE),
+     round(lasso_train$bestTune[2], 5),
+     pos = 4)
+```
+
+```{r}
+#Print the RMSE and R-Squared for model with optimal lambda
+lasso_train$results[which.min(lasso_train$results$RMSE),c("RMSE", "Rsquared")]
+```
+
+### CHOOSING THE BEST LINEAR MODEL
+
+```{r}
+#Combine each RMSE and Rsquared row into a single df
+all_vals <- rbind(
+  linear_model$results[c("RMSE", "Rsquared")],
+  forward_train$results[which.min(forward_train$results$RMSE),c("RMSE", "Rsquared")],
+  backward_train$results[which.min(backward_train$results$RMSE),c("RMSE", "Rsquared")],
+  pcr_train$results[which.min(pcr_train$results$RMSE),c("RMSE", "Rsquared")],
+  pls_train$results[which.min(pls_train$results$RMSE),c("RMSE", "Rsquared")],
+  ridge_train$results[which.min(ridge_train$results$RMSE),c("RMSE", "Rsquared")],
+  lasso_train$results[which.min(lasso_train$results$RMSE),c("RMSE", "Rsquared")]
+)
+
+#Assign corresponding row names
+rownames(all_vals) <- c(
+  'Linear',
+  'Forward (14)',
+  'Backward (10)',
+  'PCR (20)',
+  'PLS (25)',
+  'Ridge (lambda = 0.030)',
+  'Lasso (lambda = 0.002)')
+
+all_vals
+```
+
+-   Lasso Model with Lambda = 0.002 minimizes 10-Fold CV RMSE at around 0.313
+
+-   PCR Model with 20 Predictors maximizes R^2^ at around 0.031.
+
+-   In both cases, the R-squared values is extremely low, indicating that these linear models do not adequately predict number of fatalities by various crash characteristics.
+
+-   This is largely because the *vast* majority of crashes (over 98% of all crashes) in `fars14` resulted in 1 fatality. Regardless of the combination of predictors, crashes were overwhelmingly likely to result in one death; therefore, assigning 1 fatality to each crash (regardless of predictor status) will result in higher accuracy than by applying statistical predictive models.
+
+-   To better investigate the effects of various predictors on road fatalities, we turn to an updated version of FARS data. In 2018, and in response to calls for more granular measurements of road fatalities from researchers, FARS changed their reporting protocol. The new `fars18` data set offers a slightly different set of predictors, but measures injury status (rather than number of deaths).
+
+## TESTING NON-LINEAR MODELS WITH `fars18`
+
+Loading `raw_fars18` Data:
+
+```{r}
+#Loading raw data
+raw_fars18 <- read.csv('person.csv')
+
+#Defining target columns
+target_cols <- c(
+  'INJ_SEVNAME',
+  'RUR_URBNAME',
+  'MAN_COLLNAME',
+  'ROLLOVER',
+  'AGE',
+  'PER_TYPNAME',
+  'AIR_BAGNAME',
+  'ALC_RES'
+)
+
+#Restrict fars to only target columns
+fars18 <- raw_fars18[,target_cols]
+
+#Renaming variables
+fars18 <- rename(fars18,
+               'rur_urb' = 'RUR_URBNAME',
+               'coll_type' = 'MAN_COLLNAME',
+               'rollover' = 'ROLLOVER',
+               'age' = 'AGE',
+               'victim_type' = 'PER_TYPNAME',
+               'severity' = 'INJ_SEVNAME',
+               'airbag' = 'AIR_BAGNAME',
+               'bac' = 'ALC_RES')
+
+#Removing all NAs or rows with unknown values for each predictor
+fars18 <- fars18[fars18$severity != 'Unknown/Not Reported',]
+fars18 <- fars18[fars18$rur_urb != 'Not Reported',]
+fars18 <- fars18[fars18$rur_urb != 'Trafficway Not in State Inventory',]
+fars18 <- fars18[fars18$rur_urb != 'Unknown',]
+fars18 <- fars18[fars18$coll_type != 'Reported as Unknown',]
+fars18 <- fars18[fars18$coll_type != 'Not Reported',]
+fars18 <- fars18[fars18$rollover != 9,]
+fars18 <- fars18[fars18$victim_type != 
+                   'Unknown Occupant Type in a Motor Vehicle In- Transport',]
+fars18 <- fars18[fars18$age != 999,]
+fars18 <- fars18[fars18$airbag != 'Not Reported',]
+fars18 <- fars18[fars18$airbag != 'Reported as Deployment Unknown',]
+fars18 <- fars18[fars18$bac != 996,]
+fars18 <- na.omit(fars18)
+               
+#Assess dimensions
+dim(fars18)
+```
+
+Managing Variables in `fars18`:
+
+```{r}
+#Convert specific variables to factors
+factor_cols <- c('severity', 
+                 'rur_urb',
+                 'coll_type',
+                 'rollover',
+                 'victim_type',
+                 'airbag')
+
+fars18[,factor_cols] <- lapply(fars18[,factor_cols] , factor)
+
+#Assess each variable type
+str(fars18)
+```
+
+Setting Up `x` and `y` Variables:
+
+```{r}
+#Setup X and Y variables
+fars18_x <- model.matrix(~., data = fars18[,-1])
+fars18_y <- fars18$severity
+```
+
+With the `fars18` data now loaded and cleaned, we can begin testing a few non-linear models.
+
+### MODEL 8: BASIC CLASSIFICATION TREE
+
+```{r}
+#Reproducibility
+set.seed(1234)
+
+#Split fars18 into training and test sets
+fars18_train_row <- sort(sample(1:29943,size=20000)) #around 2/3 of fars18 into train
+fars18_test_row <- setdiff(1:29943, fars18_train_row) #around 1/3 of fars18 into test
+fars18_train <- fars18[fars18_train_row,]
+fars18_test <- fars18[fars18_test_row,]
+
+#Creating X and Y variables
+fars18_train_x <- fars18_train[,-1]
+fars18_train_y <- fars18_train$severity
+
+#Growing classificiation tree (minsplit set to 10% of observations; minbucket auto)
+ctree_fars18 <- rpart(severity ~ ., data = fars18_train, method = 'class',
+                    parms = list(split = 'gini'),
+                    control = rpart.control(minsplit = 2000),
+                    cp = 0)
+
+#Setting up tuning grid
+tg_ctree_fars18 <- data.frame(cp = ctree_fars18$cptable[,1])
+
+#Applying 10-Fold CV and One-SE to classification tree
+set.seed(1234)
+ctree_10cv_fars18 <- train(x = fars18_train_x, y = fars18_train_y,
+                    method = 'rpart', parms = list(split='gini'),
+                    control = rpart.control(minsplit = 2000),
+                    tuneGrid = tg_ctree_fars18,
+                    trControl = trainControl(method = 'cv',
+                                             number = 10,
+                                             selectionFunction = 'oneSE'))
+
+#Printing results for best model (max. accuracy within one SE)
+ctree_10cv_fars18$results[which.max(ctree_10cv_fars18$results$Accuracy),]
+```
+
+### MODEL 9: BOOSTED CLASSIFICATION TREE
+
+```{r}
+#Setting up tune grid with given parameters
+tg_boostclass <- expand.grid(n.trees = seq(5, 50, by = 5),
+                             interaction.depth = 1:6,
+                             shrinkage = seq(0.20, 0.45, by = 0.05),
+                             n.minobsinnode = 1000)
+
+#Training boosted classification model
+set.seed(1234) 
+train_boostclass <- train(x = fars18_train_x, y = fars18_train_y,
+                          method = 'gbm', bag.fraction = 0.50,
+                          tuneGrid = tg_boostclass,
+                          verbose = F,
+                          trControl = trainControl(method = 'cv',
+                                                   number = 10))
+
+#Looking at optimal tuning parameter combination
+train_boostclass$results[which.max(train_boostclass$results$Accuracy),]
+```
+
+### MODEL 10: RANDOM FOREST:
+
+```{r}
+#Reproducibility
+set.seed(1234)
+
+#Creating random forest classification model
+rf_10cv_fars18 <- train(x = fars18_x,
+                      y = fars18_y,
+                      method = 'rf', ntree = 500,
+                      tuneGrid = data.frame(mtry = 1:7),
+                      trControl = trainControl(method = 'cv', number = 10))
+
+#Viewing results
+rf_10cv_fars18
+```
+
+### CHOOSING THE BEST NON-LINEAR MODEL FOR `fars18`
+
+To choose the best non-linear model for predicting injury status based on the selected predictors in `fars18`, we must compare 10-Fold CV accuracy values from the previous three models:
+
+```{r}
+#Combine each accuracy value into a single df
+all_accs <- data.frame(
+  Model = c('Basic Classification', 
+            'Boosted Classification',
+            'Random Forest'),
+  Accuracy = c(0.6667509,
+               0.696749,
+               0.7058079))
+
+all_accs
+```
+
+-   Random Forest Model with 5 predictors considered at each split maximizes 10-Fold CV Accuracy at 0.706. This model correctly predicts over 70% of injury statuses based on the selected predictors.
+
+-   We can use data from the Random Forest model to produce a variable importance plot, shown below:
+
+```{r}
+#Creating data frame from MeanDecreaseGini (MDG) values
+mdg_df <- as.data.frame(rf_10cv_fars18$finalModel$importance)
+
+#Initializing x and y for plot
+pred_names <- rownames(mdg_df)
+gini_vals <- mdg_df$MeanDecreaseGini
+
+#Plotting each predictor's MDG  
+ggplot(mdg_df, aes(reorder(pred_names, gini_vals), gini_vals)) +
+  xlab('') +
+  ylab('Mean Decrease in Gini Index') +
+  ggtitle('') +
+  geom_bar(stat = 'identity') +
+  coord_flip()
+```
+
+-   Blood Alcohol Content, Vehicular Passenger Status for Victim Type, Age, and Non-Deployment of Airbags are the Top 4 predictors of fatal injuries in the `fars18` data set.
+
+-   BAC is by far the top predictor with a Mean Decrease in Gini Index of almost 1,000 (next highest is around 500).
